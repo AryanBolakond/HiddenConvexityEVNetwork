@@ -31,6 +31,9 @@ from dataclasses import dataclass
 import cvxpy as cp
 import numpy as np
 
+from ev_minlp_native import EVInstance, example_instance
+from ev_algorithm1_oa_gbd import TAU_BAR, phi, solve_sp_j
+
 warnings.filterwarnings("ignore", message="Solution may be inaccurate")
 
 def phi_prime(tau: float) -> float:
