@@ -1,38 +1,13 @@
 """
-Algorithm 2 (monolithic MISOCP benchmark) for (P-MISOCP)
-
-(P-MISOCP) is Reformulation I -- the restricted, special-case SOCP model
-built on
-
-    lambda_hat_j := sqrt(lambda_j)      (sqrt of admitted demand)
-    rho_j        := lambda_j / mu_j     (utilization)
-
-with the two EXACT rotated-cone constraints (Proposition 3.6)
-
-    (q_j, 1 - rho_j, sqrt(2) rho_j)         in Q_r^3   <=>  q_j >= rho_j^2/(1-rho_j)
-    (rho_j, mu_j, sqrt(2) lambda_hat_j)     in Q_r^3   <=>  rho_j >= lambda_hat_j^2 / mu_j
-
-and epigraph variables t^c_j >= c_j(mu_j), t^r_j >= -r_hat_j(lambda_hat_j).
-
-Algorithm 2 pseudocode (Section 4.2), implemented as solve_p_misocp():
-  1. Build the full conic model (P-MISOCP).
-  2. Tighten variable bounds for x, rho, mu, lambda_hat, lambda_bar.
-  3. Add a valid inequality linking x, routing, and capacity.
-  4. Call the MISOCP solver.
-  5. Record runtime, node count, bounds, incumbent, and final gap.
-  6. Report the solution.
-
-Solver notes: GUROBI (via cvxpy) is used when available -- it is the only
-mixed-integer-SOCP-capable solver in this environment, and its bundled
-free/restricted license comfortably covers a model this small. If GUROBI
-is not available, this script automatically falls back to a portable,
-open-source-only approach: enumerate the (small) set of station-opening
-patterns and solve the resulting CONTINUOUS SOCP with CLARABEL for each
+Algorithm 2 (monolithic MISOCP benchmark) for (P-MISOCP) / Reformulation I:
+exact rotated-cone constraints in (lambda_hat=sqrt(lambda), mu, rho), valid
+only under a revenue concave in lambda_hat (Prop 3.7)
 """
 
 from __future__ import annotations
 
 import itertools
+import math
 import time
 from dataclasses import dataclass
 
@@ -43,18 +18,43 @@ from ev_minlp_native import EVInstance, example_instance
 
 RHO_BAR = 0.995  # rho-bar: max utilization allowed in (P-MISOCP)
 
-P_HAT = {"A": 170.0, "B": 175.0, "C": 155.0}
-B_HAT = {"A": 3.0, "B": 3.0, "C": 3.0}
+# Regime-compliant revenue (concave in lambda_hat), DEFAULTS valid only for
+# example_instance()'s site names "A".."E" -- use derive_regime_revenue()
+# for any other instance, passed as P_HAT_override/B_HAT_override.
+P_HAT = {"A": 170.0, "B": 175.0, "C": 155.0, "D": 10.0, "E": 10.0}
+B_HAT = {"A": 3.0, "B": 3.0, "C": 3.0, "D": 3.0, "E": 3.0}
 
 
-def r_hat(j: str, lam_hat):
-    """Regime-compliant revenue, concave in lambda_hat_j (works for both
-    cvxpy expressions and plain floats)."""
-    return P_HAT[j] * lam_hat - B_HAT[j] * lam_hat ** 2
+def r_hat(j: str, lam_hat, P_HAT_override: dict | None = None,
+          B_HAT_override: dict | None = None):
+    """Regime-compliant revenue, concave in lambda_hat_j; uses module-level
+    P_HAT/B_HAT unless overrides are given."""
+    P = P_HAT_override if P_HAT_override is not None else P_HAT
+    B = B_HAT_override if B_HAT_override is not None else B_HAT
+    return P[j] * lam_hat - B[j] * lam_hat ** 2
+
+
+def derive_regime_revenue(inst: EVInstance, lambda_ref_frac: float = 0.6):
+    """Derives a Reformulation-I-compliant (P_HAT, B_HAT) for ANY instance,
+    by matching r_hat_j(lambda_hat) to the native r_j(lambda) in value and
+    slope at lambda_ref_j = lambda_ref_frac * M_j;"""
+    P_HAT_new, B_HAT_new = {}, {}
+    for j in inst.sites:
+        lam_ref = max(lambda_ref_frac * inst.M[j], 1e-6)
+        lam_hat_ref = math.sqrt(lam_ref)
+        r_ref = inst.r(j, lam_ref)
+        slope_ref = inst.p[j] - 2.0 * inst.b[j] * lam_ref  # r_j'(lambda_ref)
+
+        b_hat = r_ref / lam_hat_ref ** 2 - 2.0 * slope_ref
+        b_hat = max(b_hat, 1e-3)
+        p_hat = 2.0 * lam_hat_ref * (b_hat + slope_ref)
+
+        P_HAT_new[j], B_HAT_new[j] = p_hat, b_hat
+    return P_HAT_new, B_HAT_new
 
 
 def demonstrate_revenue_trap(inst: EVInstance):
-    """Reproduces Proposition 3.7 numerically."""
+    """Reproduces Proposition 3.7 numerically"""
     j = inst.sites[0]
     p_j, b_j = inst.p[j], inst.b[j]
 
@@ -73,9 +73,6 @@ def demonstrate_revenue_trap(inst: EVInstance):
         lo, hi = grid[convex_region].min(), grid[convex_region].max()
         print(f"  -> r_hat_naive is CONVEX (not concave) for lambda_hat in "
               f"[{lo:.2f}, {hi:.2f}] (d2/dlambda_hat^2 > 0 there).")
-        print("     So -r_hat_naive is non-convex there, and t^r_j >= "
-              "-r_hat_naive(lambda_hat_j) would be an invalid (non-DCP) "
-              "epigraph constraint -- confirming the paper's warning.")
     else:
         print("  -> (unexpectedly) concave everywhere on this grid.")
     print(f"  Using the regime-compliant r_hat_j(lambda_hat) = P_HAT_j*lambda_hat "
@@ -100,8 +97,13 @@ class MISOCPVars:
     tr: object
 
 
-def build_p_misocp(inst: EVInstance, x_fixed: np.ndarray | None = None):
-    """Builds (P-MISOCP)."""
+def build_p_misocp(inst: EVInstance, x_fixed: np.ndarray | None = None,
+                    P_HAT_override: dict | None = None,
+                    B_HAT_override: dict | None = None):
+    """Builds (P-MISOCP): x is a Boolean Variable if x_fixed is None (the
+    true MISOCP), else fixed data giving a pure continuous SOCP.
+    Pass P_HAT_override/B_HAT_override (see derive_regime_revenue) for any
+    instance other than example_instance()."""
     I, J = inst.zones, inst.sites
     nI, nJ = len(I), len(J)
 
@@ -138,22 +140,21 @@ def build_p_misocp(inst: EVInstance, x_fixed: np.ndarray | None = None):
         )
 
     for j_pos, j in enumerate(J):
-        # --- (P-MISOCP)'s own constraints ---
         constraints.append(cp.square(lam_hat[j_pos]) <= lam_bar[j_pos])
 
-        # rotated cones (Proposition 3.6), written via quad_over_lin
+        # rotated cones (Prop 3.6), via quad_over_lin (DCP-friendly form).
         constraints.append(rho[j_pos] <= RHO_BAR)                 # step 2: tighten
         constraints.append(cp.quad_over_lin(rho[j_pos], 1 - rho[j_pos]) <= q[j_pos])
         constraints.append(cp.quad_over_lin(lam_hat[j_pos], mu[j_pos]) <= rho[j_pos])
 
         constraints.append(tc[j_pos] >= inst.kappa[j] * cp.square(mu[j_pos]))
-        constraints.append(tr[j_pos] >= -r_hat(j, lam_hat[j_pos]))
+        constraints.append(tr[j_pos] >= -r_hat(j, lam_hat[j_pos],
+                                                 P_HAT_override, B_HAT_override))
 
         constraints.append(mu[j_pos] <= inst.M[j] * x[j_pos])
         constraints.append(cp.square(lam_hat[j_pos]) + inst.eps * x[j_pos] <= mu[j_pos])
 
-        # step 3: valid inequality linking x, routing and capacity --
-        # lambda_hat_j^2 <= M_j x_j
+        # step 3: valid inequality tying lambda_hat_j to the station's own capacity cap.
         constraints.append(cp.square(lam_hat[j_pos]) <= inst.M[j] * x[j_pos])
 
     fixed_cost = cp.sum(cp.multiply(np.array([inst.f[j] for j in J]), x))
@@ -172,7 +173,9 @@ def build_p_misocp(inst: EVInstance, x_fixed: np.ndarray | None = None):
 # Algorithm 2: monolithic MISOCP benchmark
 # --------------------------------------------------------------------------
 
-def solve_p_misocp(inst: EVInstance, verbose: bool = True):
+def solve_p_misocp(inst: EVInstance, verbose: bool = True,
+                    P_HAT_override: dict | None = None,
+                    B_HAT_override: dict | None = None):
     """Algorithm 2 pseudocode, steps 1-6."""
 
     use_gurobi = "GUROBI" in cp.installed_solvers()
@@ -183,7 +186,8 @@ def solve_p_misocp(inst: EVInstance, verbose: bool = True):
                   "bounds, valid inequality)...")
             print("Step 4: calling the MISOCP solver (GUROBI)...\n")
 
-        prob, v = build_p_misocp(inst)  # step 1-3 (x is a Boolean Variable)
+        prob, v = build_p_misocp(inst, P_HAT_override=P_HAT_override,
+                                  B_HAT_override=B_HAT_override)  # step 1-3
         t0 = time.perf_counter()
         prob.solve(solver=cp.GUROBI, verbose=False)
         wall_time = time.perf_counter() - t0
@@ -216,14 +220,16 @@ def solve_p_misocp(inst: EVInstance, verbose: bool = True):
 
     # --- portable fallback: enumerate x, solve each continuous SOCP -----
     if verbose:
-        print("GUROBI not available: falling back to enumerating station-\n")
+        print("GUROBI not available: falling back to enumerating station-"
+              "opening patterns x in {0,1}^|J| and solving.\n")
 
     J = inst.sites
     best_val, best_result = np.inf, None
     t0 = time.perf_counter()
     for pattern in itertools.product([0, 1], repeat=len(J)):
         x_fixed = np.array(pattern, dtype=float)
-        prob, v = build_p_misocp(inst, x_fixed=x_fixed)
+        prob, v = build_p_misocp(inst, x_fixed=x_fixed, P_HAT_override=P_HAT_override,
+                                  B_HAT_override=B_HAT_override)
         try:
             prob.solve(solver=cp.CLARABEL, verbose=False)
         except cp.error.SolverError:
@@ -237,11 +243,9 @@ def solve_p_misocp(inst: EVInstance, verbose: bool = True):
             print(f"  x={pattern} -> objective = {prob.value:10.3f}")
     wall_time = time.perf_counter() - t0
 
-    # In the enumeration fallback, every one of the 2^|J| continuous SOCPs
-    # is solved to (near-)global optimality (each is convex), so the best
-    # incumbent found IS the best bound
+    # every enumerated SOCP is convex, so the best incumbent IS the true optimum (gap 0).
     if verbose:
-        print("Enumeration diagnostics")
+        print("Step 5: enumeration diagnostics")
         print(f"  wall-clock time     : {wall_time:.4f} s")
         print(f"  patterns enumerated (~ 'nodes') : {2 ** len(J)}")
         print(f"  best bound (LB)     : {best_val:.6f}")
@@ -287,7 +291,7 @@ def print_solution(inst: EVInstance, detail: dict):
         else:
             print(f"  station {j}: closed")
 
-    print("\n--- routing  ---")
+    print("\n--- routing (fraction of zone demand y_ij, only nonzero) ---")
     for (i, j), val in detail["y"].items():
         if val > 1e-6:
             print(f"  y[{i},{j}] = {val:.3f}  "
@@ -300,15 +304,14 @@ def print_solution(inst: EVInstance, detail: dict):
 # --------------------------------------------------------------------------
 
 def r_native_from_r_hat(j: str, lam: float) -> float:
-    """r_native(lambda_j) := r_hat_j(sqrt(lambda_j))"""
+    """r_native(lambda_j) := r_hat_j(sqrt(lambda_j)), for the cross-check below only."""
     lam = max(lam, 0.0)
     return r_hat(j, np.sqrt(lam))
 
 
 def solve_native_cross_check(inst: EVInstance, n_restarts: int = 6):
-    """Re-solves the native (non-convexified) queueing MINLP -- using the
-    SAME r_native implied by r_hat -- via brute-force station-opening
-    enumeration, mirroring ev_minlp_native.py's approach."""
+    """Re-solves the native MINLP with r_native
+    to independently verify (P-MISOCP)'s answer."""
     import math
     from scipy.optimize import minimize
 
@@ -422,7 +425,8 @@ if __name__ == "__main__":
     print_solution(inst, detail)
 
     print("\n=================== Independent cross-check ===================")
-
+    print("Re-solving the NATIVE (non-convexified) queueing MINLP with the "
+          "SAME r_hat-implied revenue...\n")
     native_val, native_S = solve_native_cross_check(inst)
     print(f"(P-MISOCP)          optimal objective : {detail['objective']:.3f}   "
           f"opened = {tuple(j for j in inst.sites if detail['x'][j] == 1)}")
@@ -432,3 +436,7 @@ if __name__ == "__main__":
     tol = 1e-2 * max(1.0, abs(native_val))
     print(f"\nAbsolute difference: {diff:.6f} "
           f"({'MATCH' if diff <= tol else 'MISMATCH'} within tolerance {tol:.4f})")
+
+    print("\nNote: (P-MISOCP) uses a different revenue functional form than "
+          "(P-Native)/(P-HC), so its "
+          "objective value is not directly comparable to Algorithm 1.")
