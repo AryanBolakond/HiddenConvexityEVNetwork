@@ -1,50 +1,12 @@
 """
-Algorithm 1 (exact OA/GBD) for the hidden-convexity reformulation (P-HC),
-from Section 4.1 of "Hidden Convexity for Integrated EV Charging Network
-Design".
-
-(P-HC) replaces the nonconvex native queueing term
-
-    Q_inf,j(lambda_j, mu_j) = lambda_j^2 / (mu_j (mu_j - lambda_j))
-
-with the lifted variables
-
-    s_j   := mu_j^2                    (squared service rate)
-    tau_j := (lambda_j / mu_j)^2       (squared utilization)
-
-under which Q_inf,j = phi(tau_j) := tau_j / (1 - sqrt(tau_j)), a function
-that IS convex on [0,1) (Proposition 3.2), and the coupling constraint
-lambda_j^2 <= tau_j * s_j defines a convex (rotated-cone) set (Prop 3.3).
-Station recourse (SP-j) is therefore a convex program for any fixed
-(lambda_bar_j, x_j) (Theorem 3.4), and its value function V_j is convex in
-lambda_bar_j (Corollary 3.5) -- which is exactly what licenses Benders/OA
-cuts on it.
-
-Algorithm 1 alternates between:
-
-  * a MASTER problem (MP) -- a small MILP over (x, y, lambda_bar, theta)
-    with routing/opening constraints plus accumulated OA cuts
-        theta_j >= alpha_j^k x_j + pi_j^k lambda_bar_j,
-  * per-station convex SUBPROBLEMS (SP-j) -- solved to global optimality
-    (they are convex, so any KKT point found is the global optimum),
-    which supply the recourse value V_j and the dual price pi_j of the
-    lambda_j <= lambda_bar_j constraint, used to build the next cut
-    (Proposition 4.1).
-
-Only numpy/scipy are used:
-  * SP-j (convex NLP, 3 variables) is solved with scipy.optimize.minimize
-    (trust-constr) -- since it is provably convex, this returns the global
-    optimum and reliable Lagrange multipliers.
-  * (MP) (a small MILP) is solved with scipy.optimize.milp (HiGHS), which
-    ships with scipy -- no external MILP solver needed.
-
-The same instance data as the native-MINLP script (ev_minlp_native.py) is
-reused, and at the end this script re-solves (P-Native) with that script's
-brute-force+multistart routine to check that both approaches agree.
+Algorithm 1 (exact OA/GBD) for the hidden-convexity reformulation (P-HC):
+alternates a small MILP master (x, y, lambda_bar, theta) with per-station
+convex NLP subproblems (SP-j) that supply Benders/OA cuts
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import warnings
 from dataclasses import dataclass
@@ -59,26 +21,29 @@ from ev_minlp_native import EVInstance, example_instance, solve_p_native
 warnings.filterwarnings("ignore", message="delta_grad == 0.0")
 warnings.filterwarnings("ignore", message="Singular Jacobian matrix")
 
+
+def _gurobi_available() -> bool:
+    """Probes for a working Gurobi to pick the master backend: scipy's milp
+    (HiGHS) has no warm-start hook, so GurobiMasterProblem is used when
+    possible, else MasterProblem."""
+    try:
+        import gurobipy as gp
+        m = gp.Model()
+        m.dispose()
+        return True
+    except Exception:
+        return False
+
 TAU_BAR = 0.995  # tau-bar: max squared utilization allowed in (P-HC)
 
-# theta_j >= 0 is the textbook Benders default, and it IS valid whenever
-# x_j = 0 -- complete recourse (Proposition 4.2) forces V_j(lambda_bar_j, 0)
-# = 0 exactly. But V_j subtracts revenue r_j(lambda_j) and so CAN be
-# negative once a station is actually open (a profitable station). A plain
-# "theta_j >= 0" bound would then make the very first master solve blind to
-# any upside from opening anything -- it would just set x_j = 0 everywhere,
-# generate the trivial cut theta_j >= 0 again, and "converge" to that wrong
-# fixed point immediately (this is exactly what happened before this fix).
-# BIG_M_THETA gives the master a (loose, but valid) preview that opening a
-# station MIGHT be very profitable, via the linking row
-#     theta_j + BIG_M_THETA * x_j >= 0,
-# i.e. theta_j >= 0 when x_j = 0, theta_j >= -BIG_M_THETA when x_j = 1.
-# Subsequent OA cuts tighten theta_j to the true V_j quickly.
+# lets the master preview that opening a station might be profitable
+# (theta_j >= -BIG_M_THETA when x_j=1) instead of only ever seeing the
+# trivial theta_j >= 0 and never opening anything; OA cuts tighten it fast.
 BIG_M_THETA = 1.0e5
 
 
 def phi(tau: float) -> float:
-    """phi(tau) = tau / (1 - sqrt(tau)), the convexified queueing term."""
+    """phi(tau) = tau / (1 - sqrt(tau)), convexified queueing term."""
     tau = min(max(tau, 0.0), 1.0 - 1e-9)
     return tau / (1.0 - math.sqrt(tau))
 
@@ -98,14 +63,12 @@ class StationSolution:
 
 
 def _solve_sp_j_value(inst: EVInstance, j: str, xj: int, lambda_bar_j: float,
-                       n_restarts: int = 4):
-    """Solve (SP-j) for fixed (lambda_bar_j, x_j); returns (Vj, lam, s, tau, mu)
-    only -- no dual price (see solve_sp_j for that)."""
+                       n_restarts: int = 4, z0_hint: tuple | None = None):
+    """Solves (SP-j) for fixed (lambda_bar_j, x_j); returns (Vj, lam, s, tau,
+    mu)"""
 
     if xj == 0:
-        # Complete recourse (Proposition 4.2): closing the station forces
-        # s_j = 0 (0 <= s_j <= M_j^2 * 0) and hence lambda_j = 0, at zero
-        # cost, for ANY lambda_bar_j.
+        # complete recourse (Prop 4.2): closed station costs 0 for any lambda_bar_j.
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
     kappa_j, v_j, eps = inst.kappa[j], inst.v[j], inst.eps
@@ -131,7 +94,15 @@ def _solve_sp_j_value(inst: EVInstance, j: str, xj: int, lambda_bar_j: float,
 
     bounds = Bounds([0.0, 0.0, 0.0], [lambda_bar_j, M_j ** 2, TAU_BAR])
 
-    best = None
+    trial_z0s = []
+    if z0_hint is not None:
+        lam_h, s_h, tau_h = z0_hint
+        # clip into this call's box in case lambda_bar_j shifted since the hint was recorded.
+        lam_h = min(max(lam_h, 0.0), lambda_bar_j)
+        s_h = min(max(s_h, 0.0), M_j ** 2)
+        tau_h = min(max(tau_h, 0.0), TAU_BAR)
+        trial_z0s.append(np.array([lam_h, s_h, tau_h]))
+
     for trial in range(n_restarts):
         frac = 0.3 + 0.5 * trial / max(n_restarts - 1, 1)
         lam0 = min(frac * lambda_bar_j, M_j - eps - 1e-2)
@@ -139,8 +110,10 @@ def _solve_sp_j_value(inst: EVInstance, j: str, xj: int, lambda_bar_j: float,
         mu0 = min(M_j, lam0 + eps + 5.0 + 3.0 * trial)
         s0 = mu0 ** 2
         tau0 = min((lam0 / mu0) ** 2 if mu0 > 0 else 0.0, TAU_BAR)
-        z0 = np.array([lam0, s0, tau0])
+        trial_z0s.append(np.array([lam0, s0, tau0]))
 
+    best = None
+    for z0 in trial_z0s:
         res = minimize(objective, z0, method="trust-constr",
                         bounds=bounds, constraints=[cone_con, stab_con],
                         options={"maxiter": 500, "gtol": 1e-10, "xtol": 1e-13})
@@ -161,27 +134,21 @@ def _solve_sp_j_value(inst: EVInstance, j: str, xj: int, lambda_bar_j: float,
 
 
 def solve_sp_j(inst: EVInstance, j: str, xj: int, lambda_bar_j: float,
-               h: float = 1.0, n_restarts: int = 4) -> StationSolution:
-    """Solve (SP-j) and also estimate pi_j = d(Vj)/d(lambda_bar_j) <= 0.
-
-    V_j is convex and (weakly) non-increasing in lambda_bar_j (Corollary
-    3.5: more routed demand only ever relaxes the 0 <= lambda_j <=
-    lambda_bar_j constraint). Rather than trust the NLP solver's raw
-    Lagrange multiplier -- which we found to be numerically unreliable
-    exactly at the degenerate boundary lambda_bar_j = 0 (singular Jacobian,
-    since lambda_j <= lambda_bar_j and lambda_j >= 0 are both active at
-    once there) -- we estimate the slope directly with a finite difference
-    of V_j itself. This is simple, robust everywhere including at that
-    boundary, and costs only 1-2 extra convex NLP solves per call.
-    """
-    Vj, lam, s, tau, mu = _solve_sp_j_value(inst, j, xj, lambda_bar_j, n_restarts)
+               h: float = 1.0, n_restarts: int = 4,
+               z0_hint: tuple | None = None) -> StationSolution:
+    """Solves (SP-j) and estimates pi_j = d(Vj)/d(lambda_bar_j) <= 0 via a
+    finite difference of V_j."""
+    Vj, lam, s, tau, mu = _solve_sp_j_value(inst, j, xj, lambda_bar_j, n_restarts,
+                                             z0_hint=z0_hint)
 
     if xj == 0:
         pi_j = 0.0
     else:
-        Vj_plus, *_ = _solve_sp_j_value(inst, j, xj, lambda_bar_j + h, n_restarts)
+        Vj_plus, *_ = _solve_sp_j_value(inst, j, xj, lambda_bar_j + h, n_restarts,
+                                         z0_hint=z0_hint)
         if lambda_bar_j - h >= 0:
-            Vj_minus, *_ = _solve_sp_j_value(inst, j, xj, lambda_bar_j - h, n_restarts)
+            Vj_minus, *_ = _solve_sp_j_value(inst, j, xj, lambda_bar_j - h, n_restarts,
+                                              z0_hint=z0_hint)
             pi_j = (Vj_plus - Vj_minus) / (2 * h)
         else:
             pi_j = (Vj_plus - Vj) / h
@@ -225,6 +192,11 @@ class MasterProblem:
     def add_cut(self, j_pos, alpha, pi):
         self.cuts.append((j_pos, alpha, pi))
 
+    @property
+    def num_cuts(self) -> int:
+        """Total OA/Benders cuts accumulated so far."""
+        return len(self.cuts)
+
     def solve(self):
         inst, I, J, nI, nJ = self.inst, self.I, self.J, self.nI, self.nJ
 
@@ -262,10 +234,7 @@ class MasterProblem:
                 row[self._idx_y(i_pos, j_pos)] = -inst.Lambda[i]
             rows.append(row); lb.append(0.0); ub.append(0.0)
 
-        # initial relaxation: theta_j + BIG_M_THETA * x_j >= 0 (see note by
-        # BIG_M_THETA above) -- lets the master "see" that an as-yet-unpriced
-        # open station could be very profitable, instead of only ever seeing
-        # the true default theta_j >= 0 that holds for closed stations.
+        # initial relaxation: theta_j + BIG_M_THETA * x_j >= 0 (see BIG_M_THETA above).
         for j_pos in range(nJ):
             row = np.zeros(self.n_vars)
             row[self._idx_th(j_pos)] = 1.0
@@ -283,11 +252,7 @@ class MasterProblem:
         constraints = LinearConstraint(np.array(rows), np.array(lb), np.array(ub))
 
         lower = np.zeros(self.n_vars)
-        # theta's real lower bound comes from the linking row / OA cuts
-        # above, not from a flat variable bound -- leaving the default 0
-        # here would silently re-impose theta_j >= 0 on top of those rows
-        # and defeat the BIG_M_THETA relaxation (same pitfall as the
-        # lambda_j <= lambda_bar_j duplication fixed in solve_sp_j).
+        # theta's real lower bound comes from the linking row/cuts above, not a flat bound.
         lower[self._idx_th(0):self._idx_th(0) + self.n_th] = -np.inf
         upper = np.concatenate([
             np.ones(self.n_x),
@@ -314,82 +279,197 @@ class MasterProblem:
         return res.fun, x, y, lambda_bar, theta
 
 
+class GurobiMasterProblem:
+    """Same as MasterProblem, but as a persistent gurobipy Model that
+    adds cuts incrementally and MIP-warm-starts each re-solve from the
+    previous iterate."""
+
+    def __init__(self, inst: EVInstance):
+        import gurobipy as gp
+        from gurobipy import GRB
+        self._gp, self._GRB = gp, GRB
+
+        self.inst = inst
+        self.I, self.J = inst.zones, inst.sites
+
+        model = gp.Model()
+        model.setParam("OutputFlag", 0)
+        self.model = model
+
+        x = {j: model.addVar(vtype=GRB.BINARY, name=f"x_{j}") for j in self.J}
+        y = {(i, j): model.addVar(lb=0.0, ub=1.0, name=f"y_{i}_{j}")
+             for i in self.I for j in self.J}
+        lam_ub = sum(inst.Lambda.values())
+        lambda_bar = {j: model.addVar(lb=0.0, ub=lam_ub, name=f"lb_{j}") for j in self.J}
+        theta = {j: model.addVar(lb=-GRB.INFINITY, name=f"th_{j}") for j in self.J}
+        model.update()
+        self.x, self.y, self.lambda_bar, self.theta = x, y, lambda_bar, theta
+
+        for i in self.I:
+            model.addConstr(gp.quicksum(y[(i, j)] for j in self.J) <= 1.0)
+        for i in self.I:
+            for j in self.J:
+                model.addConstr(y[(i, j)] <= x[j])
+        for j in self.J:
+            model.addConstr(
+                lambda_bar[j] == gp.quicksum(inst.Lambda[i] * y[(i, j)] for i in self.I)
+            )
+        # initial BIG_M_THETA relaxation -- same rationale as MasterProblem.
+        for j in self.J:
+            model.addConstr(theta[j] + BIG_M_THETA * x[j] >= 0.0)
+
+        fixed_cost = gp.quicksum(inst.f[j] * x[j] for j in self.J)
+        travel_cost = gp.quicksum(inst.d[(i, j)] * inst.Lambda[i] * y[(i, j)]
+                                   for i in self.I for j in self.J)
+        theta_sum = gp.quicksum(theta[j] for j in self.J)
+        model.setObjective(fixed_cost + travel_cost + theta_sum, GRB.MINIMIZE)
+        model.update()
+
+        self._have_prev_solution = False
+        self._n_cuts = 0
+
+    def add_cut(self, j_pos, alpha, pi):
+        j = self.J[j_pos]
+        self.model.addConstr(
+            self.theta[j] - alpha * self.x[j] - pi * self.lambda_bar[j] >= 0.0
+        )
+        self._n_cuts += 1
+
+    @property
+    def num_cuts(self) -> int:
+        """Total OA/Benders cuts accumulated so far."""
+        return self._n_cuts
+
+    def solve(self):
+        if self._have_prev_solution:
+            for j in self.J:
+                self.x[j].Start = self._prev_x[j]
+                self.theta[j].Start = self._prev_theta[j]
+                self.lambda_bar[j].Start = self._prev_lambda_bar[j]
+            for i in self.I:
+                for j in self.J:
+                    self.y[(i, j)].Start = self._prev_y[(i, j)]
+
+        self.model.optimize()
+        if self.model.Status != self._GRB.OPTIMAL:
+            raise RuntimeError(f"Gurobi master problem failed: status {self.model.Status}")
+
+        x = {j: int(round(self.x[j].X)) for j in self.J}
+        y = {(i, j): float(self.y[(i, j)].X) for i in self.I for j in self.J}
+        lambda_bar = {j: float(self.lambda_bar[j].X) for j in self.J}
+        theta = {j: float(self.theta[j].X) for j in self.J}
+
+        self._prev_x, self._prev_y = x, y
+        self._prev_lambda_bar, self._prev_theta = lambda_bar, theta
+        self._have_prev_solution = True
+
+        return self.model.ObjVal, x, y, lambda_bar, theta
+
+
 # --------------------------------------------------------------------------
 # Algorithm 1 main loop
 # --------------------------------------------------------------------------
 
 def solve_p_hc_via_oa_gbd(inst: EVInstance, eps_gap: float = 1e-4,
-                           max_iter: int = 50, verbose: bool = True):
+                           max_iter: int = 50, verbose: bool = True,
+                           max_workers: int | None = None,
+                           sp_n_restarts: int = 4):
+    """sp_n_restarts: solve_sp_j's restart-grid size on top of its always-
+    tried warm-start hint. Since (SP-j) is provably convex, one good solve
+    already finds the global optimum."""
     I, J = inst.zones, inst.sites
-    master = MasterProblem(inst)
+
+    if _gurobi_available():
+        master = GurobiMasterProblem(inst)
+        if verbose:
+            print("Master backend: GUROBI\n")
+    else:
+        master = MasterProblem(inst)
+        if verbose:
+            print("Master backend: scipy.optimize.milp/HiGHS\n")
 
     LB, UB = -math.inf, math.inf
     best_incumbent = None
+    # j -> (lam, s, tau) from j's last open-station solve, used to warm-start
+    # the next iteration's solve_sp_j; cleared when a station closes.
+    prev_station_point: dict = {}
 
     if verbose:
         print(f"{'iter':>4} | {'master obj (LB)':>16} | {'UB candidate':>13} | {'best UB':>10} | {'gap':>10}")
 
-    for k in range(max_iter):
-        mp_obj, x, y, lambda_bar, theta = master.solve()
-        LB = max(LB, mp_obj)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for k in range(max_iter):
+            mp_obj, x, y, lambda_bar, theta = master.solve()
+            LB = max(LB, mp_obj)
 
-        station_sols = {}
-        for j_pos, j in enumerate(J):
-            if x[j] == 1:
-                station_sols[j] = solve_sp_j(inst, j, 1, lambda_bar[j])
-            else:
-                # Complete recourse (Prop 4.2): V_j(*, 0) = 0 exactly, no
-                # NLP solve needed -- and per Proposition 4.1, cuts are only
-                # ever derived from an iterate WITH x_j^k = 1 (see note by
-                # the cut-adding loop below for why a "closed-station" cut
-                # would actually be UNSOUND for future x_j = 1 iterates).
-                station_sols[j] = StationSolution(Vj=0.0, lam=0.0, s=0.0,
-                                                   tau=0.0, mu=0.0, pi=0.0)
+            # complete recourse (Prop 4.2): closed stations cost 0, no NLP solve needed.
+            station_sols = {j: StationSolution(Vj=0.0, lam=0.0, s=0.0, tau=0.0,
+                                                mu=0.0, pi=0.0)
+                             for j in J if x[j] == 0}
 
-        fixed_cost = sum(inst.f[j] * x[j] for j in J)
-        travel_cost = sum(inst.d[(i, j)] * inst.Lambda[i] * y[(i, j)]
-                           for i in I for j in J)
-        recourse_cost = sum(station_sols[j].Vj for j in J)
-        ub_candidate = fixed_cost + travel_cost + recourse_cost
-
-        if ub_candidate < UB:
-            UB = ub_candidate
-            best_incumbent = {
-                "x": dict(x), "y": dict(y), "lambda_bar": dict(lambda_bar),
-                "stations": {j: station_sols[j] for j in J},
-                "fixed_cost": fixed_cost, "travel_cost": travel_cost,
-                "recourse_cost": recourse_cost, "objective": ub_candidate,
+            # (SP-j) is convex and independent per station, so solve open ones
+            # concurrently, each warm-started from its own previous solution.
+            open_stations = [j for j in J if x[j] == 1]
+            futures = {
+                pool.submit(solve_sp_j, inst, j, 1, lambda_bar[j],
+                            n_restarts=sp_n_restarts,
+                            z0_hint=prev_station_point.get(j)): j
+                for j in open_stations
             }
+            for fut in concurrent.futures.as_completed(futures):
+                j = futures[fut]
+                station_sols[j] = fut.result()
 
-        gap = (UB - LB) / max(1.0, abs(UB))
-        if verbose:
-            print(f"{k:>4} | {mp_obj:>16.4f} | {ub_candidate:>13.4f} | {UB:>10.4f} | {gap:>10.6f}")
+            for j in J:
+                if x[j] == 1:
+                    sol = station_sols[j]
+                    prev_station_point[j] = (sol.lam, sol.s, sol.tau)
+                else:
+                    prev_station_point.pop(j, None)
 
-        # Proposition 4.1 only licenses a cut from an iterate with x_j^k = 1:
-        # the tangent theta_j >= V_j(lambda_bar_j^k,1) + pi_j^k (lambda_bar_j
-        # - lambda_bar_j^k) is valid there by convexity of V_j(., 1). A
-        # "cut" built the same way from an x_j^k = 0 iterate would collapse
-        # to theta_j >= 0 -- true when x_j = 0 (complete recourse), but NOT
-        # a valid bound once reused against a FUTURE iterate with x_j = 1,
-        # since V_j(., 1) can be very negative (a profitable open station).
-        # Skipping closed stations here is what keeps the BIG_M_THETA
-        # relaxation (see MasterProblem) from being silently overwritten.
-        for j_pos, j in enumerate(J):
-            if x[j] == 0:
-                continue
-            sol = station_sols[j]
-            alpha = sol.Vj - sol.pi * lambda_bar[j]
-            master.add_cut(j_pos, alpha, sol.pi)
+            fixed_cost = sum(inst.f[j] * x[j] for j in J)
+            travel_cost = sum(inst.d[(i, j)] * inst.Lambda[i] * y[(i, j)]
+                               for i in I for j in J)
+            recourse_cost = sum(station_sols[j].Vj for j in J)
+            ub_candidate = fixed_cost + travel_cost + recourse_cost
 
-        if UB - LB <= eps_gap * max(1.0, abs(UB)):
+            if ub_candidate < UB:
+                UB = ub_candidate
+                best_incumbent = {
+                    "x": dict(x), "y": dict(y), "lambda_bar": dict(lambda_bar),
+                    "stations": {j: station_sols[j] for j in J},
+                    "fixed_cost": fixed_cost, "travel_cost": travel_cost,
+                    "recourse_cost": recourse_cost, "objective": ub_candidate,
+                }
+
+            gap = (UB - LB) / max(1.0, abs(UB))
             if verbose:
-                print(f"\nConverged after {k + 1} iterations "
-                      f"(UB - LB = {UB - LB:.6g} <= tol).")
-            break
-    else:
-        if verbose:
-            print("\nReached max_iter without closing the gap "
-                  f"(UB - LB = {UB - LB:.6g}).")
+                print(f"{k:>4} | {mp_obj:>16.4f} | {ub_candidate:>13.4f} | {UB:>10.4f} | {gap:>10.6f}")
+                print(f"dual values (pi_j for open stations): {[station_sols[j].pi for j in J if x[j] == 1]}")
+
+            # Prop 4.1 only licenses cuts from x_j^k=1 iterates; a cut from a
+            # closed station would wrongly collapse to theta_j >= 0 for future opens.
+            for j_pos, j in enumerate(J):
+                if x[j] == 0:
+                    continue
+                sol = station_sols[j]
+                alpha = sol.Vj - sol.pi * lambda_bar[j]
+                master.add_cut(j_pos, alpha, sol.pi)
+
+            if UB - LB <= eps_gap * max(1.0, abs(UB)):
+                if verbose:
+                    print(f"\nConverged after {k + 1} iterations "
+                          f"(UB - LB = {UB - LB:.6g} <= tol).")
+                break
+        else:
+            if verbose:
+                print("\nReached max_iter without closing the gap "
+                      f"(UB - LB = {UB - LB:.6g}).")
+
+    # stashed on the incumbent dict so existing 3-way unpacking still works.
+    if best_incumbent is not None:
+        best_incumbent["n_iterations"] = k + 1
+        best_incumbent["n_cuts"] = master.num_cuts
 
     return UB, LB, best_incumbent
 
@@ -433,8 +513,7 @@ if __name__ == "__main__":
     print_incumbent(inst, incumbent)
 
     print("\n=================== Cross-check against (P-Native) ===================")
-    print("Re-solving the native MINLP (brute-force x + multistart NLP, from "
-          "ev_minlp_native.py) on the SAME instance...\n")
+    print("Re-solving the native MINLP on the SAME instance...\n")
     native_val, native_detail, native_S = solve_p_native(inst, verbose=False)
 
     print(f"(P-Native) optimal objective : {native_val:.3f}   opened = {native_S}")
